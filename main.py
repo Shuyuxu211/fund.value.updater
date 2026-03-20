@@ -6,21 +6,23 @@
     pip install akshare pandas openpyxl
 
 功能概述：
-1. 自动更新三个 Sheet："主推公募"、"ETF"、"个人关注产品"（8列表头 + 数据更新）
+1. 自动更新三个 Sheet："主推公募"、"ETF"、"个人关注产品"（10列表头 + 数据更新）
 2. "私募资管" Sheet 完全不处理，只完整复制继承（支持用户随意自定义表头、加列、改格式）
 3. 历史文件继承（跨日自动找最近历史文件复制所有内容）
 4. 全量基金名称映射（解决建仓期名称问题）
-5. 成立以来收益率使用累计净值计算（含分红复利）
-6. 短期涨跌幅使用单位净值计算（不含分红）
-7. 更新时间统一写在 J1
-8. 列宽自动调整（支持长中文基金名称完整显示）
-9. 数据获取速度优化（0.3-0.6秒随机间隔）
+5. 所有收益率均使用累计净值计算（含分红复利）
+6. 近1年波动率（年化标准差×√252）和夏普比率（无风险利率1.5%，无额外请求）
+7. 每次运行后按当日收益率对各Sheet降序排列（None置底）
+8. 更新时间统一写在 K1
+9. 列宽自动调整（支持长中文基金名称完整显示）
+10. 数据获取速度优化（0.3-0.6秒随机间隔）
 """
 
 import os
 import sys
 import time
 import logging
+import math
 import re
 import shutil
 import random
@@ -50,16 +52,20 @@ MANUAL_SHEET = "私募资管"  # 手动Sheet，不自动处理
 SHEET_ORDER = ["主推公募", "ETF", "私募资管", "个人关注产品"]  # Sheet显示顺序
 ALL_SHEETS = AUTO_SHEETS + [MANUAL_SHEET]  # 所有需要存在的Sheet
 
-# 表头定义
+# 表头定义（10列，A-J）
 HEADERS = [
-    "产品代码", "产品名称", "最新净值",
-    "当日涨跌幅(%)", "近7天涨跌幅(%)", "近1月涨跌幅(%)", "近1年涨跌幅(%)",
+    "产品代码", "产品名称", "最新累计净值",
+    "当日收益率(%)", "近7天收益率(%)", "近1月收益率(%)", "近1年收益率(%)",
+    "近1年波动率(%)", "近1年夏普",
     "成立以来收益率(%)"
 ]
 
-# 更新时间配置
-TIMESTAMP_CELL = "J1"
+# 更新时间配置（K1，J列已用于成立以来收益率）
+TIMESTAMP_CELL = "K1"
 TIMESTAMP_PREFIX = "更新时间："
+
+# 年化无风险利率（用于夏普比率计算，参考中国1年期国债收益率）
+RISK_FREE_RATE_ANNUAL = 0.015
 
 # 请求节流配置（随机间隔，避免触发风控）
 REQUEST_INTERVAL_MIN = 0.3
@@ -298,9 +304,10 @@ def load_or_inherit_workbook():
     file_path = get_today_filename()
     
     if file_path.exists():
-        # 当天文件已存在，直接加载
-        wb = load_workbook(file_path)
+        # data_only=True: 确保读取纯数据，避免 openpyxl 对现有单元格的缓存数据型存留
+        wb = load_workbook(file_path, data_only=True)
         logging.info(f"已加载当日文件：{file_path}")
+
         
         # 确保所有需要的 Sheet 存在且有表头
         for sheet_name in ALL_SHEETS:
@@ -490,16 +497,17 @@ def fetch_fund_name_from_akshare(code: str):
 
 def fetch_fund_data(code: str):
     """
-    获取基金数据（统一使用 AKShare 历史净值接口）
-    
+    获取基金数据（统一使用 AKShare 累计净值走势接口）
+    所有收益率均基于累计净值计算（含分红复利）
+
     返回字典：
         {
             "name": 名称或 None,
-            "nav": 最新净值(float) 或 None,
-            "today_pct": 当日涨跌幅(float, %) 或 None,
-            "week_pct": 最近7天涨跌幅(float, %) 或 None,
-            "month_pct": 近1月涨跌幅(float, %) 或 None,
-            "year_pct": 近1年涨跌幅(float, %) 或 None,
+            "nav": 最新累计净值(float) 或 None,
+            "today_pct": 当日收益率(float, %) 或 None,
+            "week_pct": 近7天收益率(float, %) 或 None,
+            "month_pct": 近1月收益率(float, %) 或 None,
+            "year_pct": 近1年收益率(float, %) 或 None,
             "since_inception_pct": 成立以来收益率(float, %) 或 None,
             "is_building_period": True/False (是否为建仓期/封闭期基金)
         }
@@ -507,18 +515,18 @@ def fetch_fund_data(code: str):
     """
     if not HAS_AKSHARE:
         raise RuntimeError("akshare 未安装，无法获取基金数据")
-    
-    # 使用 fund_open_fund_info_em 接口获取单位净值走势
+
+    # 使用累计净值走势作为唯一数据源
     try:
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+        df = ak.fund_open_fund_info_em(symbol=code, indicator="累计净值走势")
     except Exception as e:
         name = fetch_fund_name_from_akshare(code)
         if name:
             raise RuntimeError(f"建仓期/封闭期基金: {e}")
         else:
-            raise RuntimeError(f"AKShare 获取净值走势失败：{e}")
-    
-    # 检查数据是否为空
+            raise RuntimeError(f"AKShare 获取累计净值走势失败：{e}")
+
+    # 检查数据是否为空（建仓期基金）
     if df is None or df.empty:
         name = fetch_fund_name_from_akshare(code)
         if name:
@@ -534,28 +542,26 @@ def fetch_fund_data(code: str):
             }
         else:
             raise RuntimeError("AKShare 返回空数据且无法获取基金名称")
-    
+
     # 规范字段名（不同版本列名可能略有差异，做个兼容）
     col_map = {}
     for col in df.columns:
         c = str(col)
         if "净值日期" in c or "日期" in c or "date" in c.lower():
             col_map["date"] = col
-        elif "单位净值" in c or "净值" in c or "nav" in c.lower():
-            col_map["nav"] = col
-        elif "日增长率" in c or "涨跌幅" in c or "change" in c.lower() or "增长率" in c:
-            col_map["pct"] = col
+        elif "累计净值" in c:
+            col_map["acc_nav"] = col
         elif "基金名称" in c or "名称" in c or "name" in c.lower():
             col_map["name"] = col
-    
-    if "date" not in col_map or "nav" not in col_map:
-        raise RuntimeError("AKShare 数据列结构无法解析")
-    
+
+    if "date" not in col_map or "acc_nav" not in col_map:
+        raise RuntimeError("AKShare 累计净值数据列结构无法解析")
+
     df = df.copy()
     df[col_map["date"]] = pd.to_datetime(df[col_map["date"]], errors="coerce")
     df = df.dropna(subset=[col_map["date"]])
     df = df.sort_values(col_map["date"])
-    
+
     if len(df) == 0:
         name = fetch_fund_name_from_akshare(code)
         if name:
@@ -571,26 +577,15 @@ def fetch_fund_data(code: str):
             }
         else:
             raise RuntimeError("AKShare 处理后数据为空且无法获取基金名称")
-    
+
     latest = df.iloc[-1]
-    
-    # 获取最新净值
+
+    # 获取最新累计净值
     try:
-        nav = float(latest[col_map["nav"]])
+        nav = float(latest[col_map["acc_nav"]])
     except Exception:
         nav = None
-    
-    # 获取当日涨跌幅（日增长率）
-    today_pct = None
-    if "pct" in col_map:
-        raw_pct = latest[col_map["pct"]]
-        if pd.notna(raw_pct):
-            try:
-                pct_str = str(raw_pct).replace("%", "").strip()
-                today_pct = float(pct_str)
-            except Exception:
-                today_pct = None
-    
+
     # 获取基金名称
     name = None
     if "name" in col_map:
@@ -598,21 +593,30 @@ def fetch_fund_data(code: str):
             name = str(latest[col_map["name"]])
         except Exception:
             pass
-    
     if not name:
         name = fetch_fund_name_from_akshare(code)
-    
-    # 计算近7天涨跌幅：找最近7个交易日的数据
+
+    # 计算当日收益率：今日累计净值 / 昨日累计净值 - 1
+    today_pct = None
+    if nav is not None and len(df) >= 2:
+        try:
+            prev_acc_nav = float(df.iloc[-2][col_map["acc_nav"]])
+            if prev_acc_nav > 0:
+                today_pct = (nav / prev_acc_nav - 1.0) * 100.0
+        except Exception:
+            today_pct = None
+
+    # 计算近7天收益率：最近7个交易日的累计净值变化
     week_pct = None
     if nav is not None and len(df) >= 7:
         try:
-            nav_7_ago = float(df.iloc[-7][col_map["nav"]])
-            if nav_7_ago > 0:
-                week_pct = (nav / nav_7_ago - 1.0) * 100.0
+            acc_nav_7_ago = float(df.iloc[-7][col_map["acc_nav"]])
+            if acc_nav_7_ago > 0:
+                week_pct = (nav / acc_nav_7_ago - 1.0) * 100.0
         except Exception:
             week_pct = None
-    
-    # 计算近1月涨跌幅：找到约30天前的净值
+
+    # 计算近1月收益率：30天前的累计净值
     month_pct = None
     if nav is not None and len(df) > 0:
         try:
@@ -622,71 +626,65 @@ def fetch_fund_data(code: str):
             if mask.any():
                 month_df = df[mask]
                 if len(month_df) > 0:
-                    nav_month_ago = float(month_df.iloc[-1][col_map["nav"]])
-                    if nav_month_ago > 0:
-                        month_pct = (nav / nav_month_ago - 1.0) * 100.0
+                    acc_nav_month_ago = float(month_df.iloc[-1][col_map["acc_nav"]])
+                    if acc_nav_month_ago > 0:
+                        month_pct = (nav / acc_nav_month_ago - 1.0) * 100.0
         except Exception:
             month_pct = None
-    
-    # 计算近1年涨跌幅：找到约365天前的净值
+
+    # 计算近1年收益率、波动率、夏普比率（复用同一段数据，无额外请求）
     year_pct = None
+    volatility_1y_pct = None
+    sharpe_1y = None
     if nav is not None and len(df) > 0:
         try:
             latest_date = pd.to_datetime(df.iloc[-1][col_map["date"]])
             target_date = latest_date - pd.Timedelta(days=365)
             mask = df[col_map["date"]] <= target_date
+
+            # 只有基金成立超过1年（即存在365天前的数据点），才计算这组指标
             if mask.any():
                 year_df = df[mask]
                 if len(year_df) > 0:
-                    nav_year_ago = float(year_df.iloc[-1][col_map["nav"]])
-                    if nav_year_ago > 0:
-                        year_pct = (nav / nav_year_ago - 1.0) * 100.0
+                    acc_nav_year_ago = float(year_df.iloc[-1][col_map["acc_nav"]])
+                    if acc_nav_year_ago > 0:
+                        year_pct = (nav / acc_nav_year_ago - 1.0) * 100.0
+
+                # 近1年数据子集（用于计算波动率）：成立超过1年才执行
+                year_mask = df[col_map["date"]] > target_date
+                year_data = df[year_mask]
+
+                # 计算近1年年化波动率（日收益率标准差 × √252）
+                if len(year_data) >= 5:  # 至少5个交易日
+                    try:
+                        daily_returns = year_data[col_map["acc_nav"]].astype(float).pct_change().dropna()
+                        if len(daily_returns) >= 2:
+                            vol_decimal = daily_returns.std() * math.sqrt(252)
+                            volatility_1y_pct = vol_decimal * 100.0
+                            # 夏普比率：仅在年化收益率为正时有意义
+                            # 负收益率时夏普无意义（结果虽可计算但容易误导），置空
+                            if year_pct is not None and year_pct >= 0 and vol_decimal > 0:
+                                sharpe_1y = (year_pct / 100.0 - RISK_FREE_RATE_ANNUAL) / vol_decimal
+                            else:
+                                sharpe_1y = None
+
+                    except Exception:
+                        volatility_1y_pct = None
+                        sharpe_1y = None
         except Exception:
             year_pct = None
-    
-    # 计算成立以来收益率：优先使用累计净值（包含分红），否则使用单位净值（不含分红）
+
+    # 计算成立以来收益率：最新累计净值 / 首日累计净值 - 1（直接使用已有数据，无需额外请求）
     since_inception_pct = None
     if nav is not None and len(df) > 0:
-        # 优先尝试获取累计净值数据
         try:
-            acc_df = ak.fund_open_fund_info_em(symbol=code, indicator="累计净值走势")
-            if acc_df is not None and not acc_df.empty:
-                acc_col_map = {}
-                for col in acc_df.columns:
-                    c = str(col)
-                    if "净值日期" in c or "日期" in c or "date" in c.lower():
-                        acc_col_map["date"] = col
-                    elif "累计净值" in c:
-                        acc_col_map["acc_nav"] = col
-                
-                if "date" in acc_col_map and "acc_nav" in acc_col_map:
-                    acc_df = acc_df.copy()
-                    acc_df[acc_col_map["date"]] = pd.to_datetime(acc_df[acc_col_map["date"]], errors="coerce")
-                    acc_df = acc_df.dropna(subset=[acc_col_map["date"], acc_col_map["acc_nav"]])
-                    acc_df = acc_df.sort_values(acc_col_map["date"])
-                    
-                    if len(acc_df) > 0:
-                        first_row = acc_df.iloc[0]
-                        latest_row = acc_df.iloc[-1]
-                        inception_acc_nav = float(first_row[acc_col_map["acc_nav"]])
-                        latest_acc_nav = float(latest_row[acc_col_map["acc_nav"]])
-                        if inception_acc_nav > 0:
-                            since_inception_pct = (latest_acc_nav / inception_acc_nav - 1.0) * 100.0
-                            logging.info(f"代码 {code} 使用累计净值计算成立以来收益率（含分红）")
-        except Exception as e:
-            logging.debug(f"代码 {code} 无法获取累计净值数据：{e}")
-        
-        # 如果累计净值计算失败，使用单位净值计算
-        if since_inception_pct is None:
-            try:
-                first_row = df.iloc[0]
-                inception_nav = float(first_row[col_map["nav"]])
-                if inception_nav > 0:
-                    since_inception_pct = (nav / inception_nav - 1.0) * 100.0
-                    logging.info(f"代码 {code} 成立以来收益率使用单位净值计算（不含分红）")
-            except Exception:
-                since_inception_pct = None
-    
+            inception_acc_nav = float(df.iloc[0][col_map["acc_nav"]])
+            if inception_acc_nav > 0:
+                since_inception_pct = (nav / inception_acc_nav - 1.0) * 100.0
+                logging.info(f"代码 {code} 使用累计净值计算全部收益率（含分红）")
+        except Exception:
+            since_inception_pct = None
+
     return {
         "name": name,
         "nav": nav,
@@ -694,44 +692,64 @@ def fetch_fund_data(code: str):
         "week_pct": week_pct,
         "month_pct": month_pct,
         "year_pct": year_pct,
+        "volatility_1y_pct": volatility_1y_pct,
+        "sharpe_1y": sharpe_1y,
         "since_inception_pct": since_inception_pct,
         "is_building_period": False,
     }
 
 
+
 # ===================== Excel格式化函数 =====================
+
 
 def format_sheet(ws):
     """
     格式化 Sheet（不包含列宽调整）：
     - A列（产品代码）设置为文本格式，防止前导零丢失
-    - 数字列（净值、涨跌幅）设置格式：5位小数（净值）、2位小数+%（涨跌幅）
+    - C列（最新累计净值）：5位小数
+    - D-H列（各收益率+波动率）：百分比格式，2位小数
+    - I列（夏普比率）：普通数字格式，2位小数（不带%）
+    - J列（成立以来收益率）：百分比格式，2位小数
     私募资管Sheet不格式化，保留手动设置
     """
     if ws.title == MANUAL_SHEET:
         return
-    
+
     # 设置A列为文本格式（从第2行开始）
     if ws.max_row >= 2:
         for row in range(2, ws.max_row + 1):
             cell = ws.cell(row=row, column=1)
             if cell.value is not None:
                 cell.number_format = "@"
-    
-    # 设置数字列格式：C列（最新净值）、D-H列（各种涨跌幅）
+
+    # 设置数字列格式
     if ws.max_row >= 2:
-        # C列：净值，5位小数
+        # C列：累计净值，5位小数
         for row in range(2, ws.max_row + 1):
             cell = ws.cell(row=row, column=3)
             if cell.value is not None and isinstance(cell.value, (int, float)):
                 cell.number_format = "0.00000"
-        
-        # D-H列：涨跌幅，2位小数+%符号
+
+        # D-H列（当日/7天/1月/1年收益率 + 近1年波动率）：百分比，2位小数
         for col_idx in [4, 5, 6, 7, 8]:
             for row in range(2, ws.max_row + 1):
                 cell = ws.cell(row=row, column=col_idx)
                 if cell.value is not None and isinstance(cell.value, (int, float)):
                     cell.number_format = "0.00%"
+
+        # I列（近1年夏普）：普通数字，2位小数，不带%
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=9)
+            if cell.value is not None and isinstance(cell.value, (int, float)):
+                cell.number_format = "0.00"
+
+        # J列（成立以来收益率）：百分比，2位小数
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=10)
+            if cell.value is not None and isinstance(cell.value, (int, float)):
+                cell.number_format = "0.00%"
+
 
 
 def adjust_column_widths(ws):
@@ -765,7 +783,8 @@ def adjust_column_widths(ws):
                 if cell.value is not None:
                     if isinstance(cell.value, (int, float)):
                         # 判断是否为百分比格式列
-                        is_pct_col = col_letter in ["D", "E", "F", "G", "H"]
+                        # H=波动率(%), D/E/F/G=收益率(%), J=成立以来(%); I=夏普(纯数字)
+                        is_pct_col = col_letter in ["D", "E", "F", "G", "H", "J"]
                         if is_pct_col:
                             display_value = cell.value * 100
                             display_text = f"{display_value:.2f}%"
@@ -798,23 +817,67 @@ def adjust_column_widths(ws):
 
 def write_update_time(ws):
     """
-    在 Sheet 指定单元格写入更新时间
+    在 Sheet 指定单元格写入更新时间（K1）
     清除可能存在的其他位置的更新时间，确保只写入一次
     私募资管Sheet不写入更新时间，保留手动内容
     """
     if ws.title == MANUAL_SHEET:
         return
-    
+
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    # 清除可能存在的其他位置的更新时间（I1, H1等）
-    for cell_ref in ["I1", "H1", "G1"]:
+    # 清除其他位置可能存在的旧时间戳
+    for cell_ref in ["J1", "I1", "H1", "G1"]:
         try:
             if ws[cell_ref].value and str(ws[cell_ref].value).startswith(TIMESTAMP_PREFIX):
                 ws[cell_ref].value = None
         except Exception:
             pass
-    # 写入到J1位置
+    # 写入到 K1 位置
     ws[TIMESTAMP_CELL] = f"{TIMESTAMP_PREFIX}{now_str}"
+
+
+
+# ===================== Sheet排序函数 =====================
+
+def sort_sheet_by_daily_return(ws):
+    """
+    按当日收益率（D列）对 Sheet 的数据行降序排序
+    - None 值（无数据/建仓期）置于底部
+    - 私募资管 Sheet 不进行排序
+    """
+    if ws.title == MANUAL_SHEET:
+        return
+    if ws.max_row <= 2:  # 只有表头行或无数据，跳过
+        return
+
+    total_cols = ws.max_column
+    # 读取所有数据行（第2行起）为列表
+    rows_data = []
+    for row_idx in range(2, ws.max_row + 1):
+        row_values = [ws.cell(row=row_idx, column=col).value for col in range(1, total_cols + 1)]
+        if row_values[0] is None or row_values[0] == "":
+            rows_data.append((None, row_values))
+        else:
+            # 第4列（D列，当日收益率）作为排序键
+            sort_key = row_values[3] if len(row_values) > 3 else None
+            # 空字符串视为无值
+            if sort_key == "" or sort_key is None:
+                sort_key = None
+            rows_data.append((sort_key, row_values))
+
+    # 降序排序：无值置底
+    rows_data.sort(key=lambda x: (x[0] is None, -(x[0] if x[0] is not None else 0)))
+
+
+    # 回写排序后的数据
+    # 对 None 值写入空字符串（openpyxl 对已加载文件写 None 不会覆盖旧值）
+    for i, (_, row_values) in enumerate(rows_data):
+        target_row = i + 2
+        for col_idx, value in enumerate(row_values, start=1):
+            ws.cell(row=target_row, column=col_idx, value=value if value is not None else "")
+
+
+    logging.info(f"Sheet '{ws.title}' 已按当日收益率降序排列")
 
 
 # ===================== Sheet更新函数 =====================
@@ -823,10 +886,11 @@ def update_sheet(ws, name_map=None):
     """
     更新单个 Sheet：
     - 读取 A 列基金代码
-    - 获取数据并写入相应列（包含H列成立以来收益率）
-    - 写入更新时间
+    - 获取数据并写入相应列（A-J，包含波动率、夏普、成立以来收益率）
+    - 按当日收益率降序排列（私募资管跳过）
+    - 写入更新时间（K1）
     - 应用格式设置（不包含列宽调整）
-    
+
     参数:
         ws: 工作表对象
         name_map: 全量基金名称映射字典，如果提供则优先使用
@@ -837,15 +901,15 @@ def update_sheet(ws, name_map=None):
     total = len(codes)
     success = 0
     failed = 0
-    
+
     if total == 0:
         write_update_time(ws)
         format_sheet(ws)
         logging.info(f"Sheet '{ws.title}' 无基金代码需要处理")
         return total, success, failed
-    
+
     logging.info(f"开始处理 Sheet '{ws.title}'，共 {total} 个代码")
-    
+
     for idx, (row_idx, code) in enumerate(codes, start=1):
         logging.info(f"[{ws.title}] {idx}/{total} 正在处理代码：{code}")
         try:
@@ -856,56 +920,42 @@ def update_sheet(ws, name_map=None):
             week_pct = data.get("week_pct")
             month_pct = data.get("month_pct")
             year_pct = data.get("year_pct")
+            volatility_1y_pct = data.get("volatility_1y_pct")
+            sharpe_1y = data.get("sharpe_1y")
             since_inception_pct = data.get("since_inception_pct")
             is_building_period = data.get("is_building_period", False)
-            
+
             if is_building_period:
                 logging.info(f"代码 {code} 为建仓期/封闭期基金，已取最新披露净值（非当日）或待手动补充")
-            
+
             # 写入名称（B列）：优先使用name_map
             if name_map and code in name_map:
                 name = name_map[code]
-            if name:
-                ws.cell(row=row_idx, column=2, value=name)
-            else:
-                ws.cell(row=row_idx, column=2, value=None)
-            
-            # 写入最新净值（C列）
-            if nav is not None:
-                ws.cell(row=row_idx, column=3, value=nav)
-            else:
-                ws.cell(row=row_idx, column=3, value=None)
-            
-            # 写入涨跌幅列（D-H列）
-            if today_pct is not None:
-                ws.cell(row=row_idx, column=4, value=today_pct / 100.0)
-            else:
-                ws.cell(row=row_idx, column=4, value=None)
-            
-            if week_pct is not None:
-                ws.cell(row=row_idx, column=5, value=week_pct / 100.0)
-            else:
-                ws.cell(row=row_idx, column=5, value=None)
-            
-            if month_pct is not None:
-                ws.cell(row=row_idx, column=6, value=month_pct / 100.0)
-            else:
-                ws.cell(row=row_idx, column=6, value=None)
-            
-            if year_pct is not None:
-                ws.cell(row=row_idx, column=7, value=year_pct / 100.0)
-            else:
-                ws.cell(row=row_idx, column=7, value=None)
-            
-            if since_inception_pct is not None:
-                ws.cell(row=row_idx, column=8, value=since_inception_pct / 100.0)
-            else:
-                ws.cell(row=row_idx, column=8, value=None)
-            
+            ws.cell(row=row_idx, column=2, value=name if name else None)
+
+            # 写入最新累计净值（C列）
+            ws.cell(row=row_idx, column=3, value=nav if nav is not None else "")
+
+            # 写入各收益率（D-G列）
+            # 使用 "" 而非 None：openpyxl 对已加载文件写 None 不会覆盖旧值
+            ws.cell(row=row_idx, column=4, value=(today_pct / 100.0 if today_pct is not None else ""))
+            ws.cell(row=row_idx, column=5, value=(week_pct / 100.0 if week_pct is not None else ""))
+            ws.cell(row=row_idx, column=6, value=(month_pct / 100.0 if month_pct is not None else ""))
+            ws.cell(row=row_idx, column=7, value=(year_pct / 100.0 if year_pct is not None else ""))
+
+            # 写入近1年波动率（H列，第8列）
+            ws.cell(row=row_idx, column=8, value=(volatility_1y_pct / 100.0 if volatility_1y_pct is not None else ""))
+
+            # 写入近1年夏普比率（I列，第9列）— 直接写数字，不除以100
+            ws.cell(row=row_idx, column=9, value=sharpe_1y if sharpe_1y is not None else "")
+
+            # 写入成立以来收益率（J列，第10列）
+            ws.cell(row=row_idx, column=10, value=(since_inception_pct / 100.0 if since_inception_pct is not None else ""))
+
             success += 1
         except Exception as e:
             error_msg = str(e)
-            # 优先从name_map获取名称
+            # 优先从 name_map 获取名称
             name = None
             if name_map and code in name_map:
                 name = name_map[code]
@@ -914,25 +964,24 @@ def update_sheet(ws, name_map=None):
                     name = fetch_fund_name_from_akshare(code)
                 except Exception:
                     pass
-            
+
             # 检查是否是建仓期基金的异常
             if "建仓期" in error_msg or "封闭期" in error_msg:
                 if name:
                     logging.info(f"代码 {code} 为建仓期/封闭期基金，已取最新披露净值（非当日）或待手动补充")
                     ws.cell(row=row_idx, column=2, value=name)
-                    for col in [3, 4, 5, 6, 7, 8]:
-                        ws.cell(row=row_idx, column=col, value=None)
+                    for col in range(3, 11):  # C到J列全部清空
+                        ws.cell(row=row_idx, column=col, value="")
                     success += 1
                 else:
                     logging.warning(f"[{ws.title}] 代码 {code} 数据获取失败：{e}")
                     ws.cell(row=row_idx, column=2, value="数据获取失败")
                     failed += 1
             else:
-                # 普通异常，如果能获取到名称，也填充名称
                 if name:
                     logging.warning(f"[{ws.title}] 代码 {code} 净值获取失败，但已获取名称：{e}")
                     ws.cell(row=row_idx, column=2, value=name)
-                    for col in [3, 4, 5, 6, 7, 8]:
+                    for col in range(3, 11):  # C到J列全部清空
                         ws.cell(row=row_idx, column=col, value=None)
                     success += 1
                 else:
@@ -940,15 +989,17 @@ def update_sheet(ws, name_map=None):
                     ws.cell(row=row_idx, column=2, value="数据获取失败")
                     failed += 1
         finally:
-            # 使用随机间隔，避免触发风控，同时提升速度
             sleep_time = random.uniform(REQUEST_INTERVAL_MIN, REQUEST_INTERVAL_MAX)
             time.sleep(sleep_time)
-    
-    # 应用格式设置（不包含列宽调整）
+
+    # 按当日收益率降序排列（私募资管Sheet自动跳过）
+    sort_sheet_by_daily_return(ws)
+    # 排列后重新应用格式设置
     format_sheet(ws)
     write_update_time(ws)
     logging.info(f"完成 Sheet '{ws.title}'：总数 {total}，成功 {success}，失败 {failed}")
     return total, success, failed
+
 
 
 # ===================== 主函数 =====================
@@ -1011,8 +1062,24 @@ def main():
     reorder_sheets(wb)
     logging.info("Sheet 顺序已调整为：主推公募 → ETF → 私募资管 → 个人关注产品")
     
+    # 保存前强制清除所有 None 单元格
+    # openpyxl 对已加载文件的单元格设 value=None 后，XML 中仍可能保留旧值节点
+    # 通过从 _cells 字典中彻底删除这些单元格，确保保存后 xlsx 中不含幽灵数据
+    for sheet_name in AUTO_SHEETS:
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            keys_to_delete = []
+            for (row, col), cell in ws._cells.items():
+                if row >= 2 and cell.value is None:
+                    keys_to_delete.append((row, col))
+            for key in keys_to_delete:
+                del ws._cells[key]
+            if keys_to_delete:
+                logging.info(f"Sheet '{sheet_name}': 清除了 {len(keys_to_delete)} 个空单元格")
+    
     # 保存文件（覆盖）
     wb.save(file_path)
+
     
     # 输出完成信息
     logging.info(f"更新完成：总共处理基金 {grand_total} 个，成功 {grand_success} 个，失败 {grand_failed} 个")
