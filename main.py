@@ -472,7 +472,7 @@ def load_fund_name_map():
 
 def fetch_fund_name_from_akshare(code: str):
     """
-    尝试从 AKShare 获取基金名称（用于建仓期基金）
+    尝试从 AKShare 获取基金名称（用于建仓期基金或新上市ETF）
     
     返回:
         基金名称字符串，如果失败则返回 None
@@ -480,6 +480,7 @@ def fetch_fund_name_from_akshare(code: str):
     if not HAS_AKSHARE:
         return None
     
+    # 1. 尝试从常规公募名单中获取
     try:
         name_df = ak.fund_em_fund_name()
         if name_df is not None and not name_df.empty:
@@ -487,6 +488,17 @@ def fetch_fund_name_from_akshare(code: str):
                 matched = name_df[name_df["基金代码"] == code]
                 if not matched.empty and "基金简称" in matched.columns:
                     return str(matched.iloc[0]["基金简称"])
+    except Exception:
+        pass
+        
+    # 2. 从实时场内 ETF 名单中获取（用于刚上市尚未纳入常规公募名单的纯新 ETF）
+    try:
+        etf_df = ak.fund_etf_spot_em()
+        if etf_df is not None and not etf_df.empty:
+            if "代码" in etf_df.columns:
+                matched = etf_df[etf_df["代码"] == code]
+                if not matched.empty and "名称" in matched.columns:
+                    return str(matched.iloc[0]["名称"])
     except Exception:
         pass
     
