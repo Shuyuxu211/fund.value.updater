@@ -472,16 +472,16 @@ def load_fund_name_map():
 
 def fetch_fund_name_from_akshare(code: str):
     """
-    尝试从 AKShare 获取基金名称（用于建仓期基金或新上市ETF）
+    尝试从 AKShare 获取基金名称（用于建仓期基金）
     
     返回:
         基金名称字符串，如果失败则返回 None
     """
     if not HAS_AKSHARE:
         return None
-    
-    # 1. 尝试从常规公募名单中获取
+        
     try:
+        # 尝试从 AKShare 获取基金名称列表并匹配
         name_df = ak.fund_em_fund_name()
         if name_df is not None and not name_df.empty:
             if "基金代码" in name_df.columns:
@@ -491,17 +491,6 @@ def fetch_fund_name_from_akshare(code: str):
     except Exception:
         pass
         
-    # 2. 从实时场内 ETF 名单中获取（用于刚上市尚未纳入常规公募名单的纯新 ETF）
-    try:
-        etf_df = ak.fund_etf_spot_em()
-        if etf_df is not None and not etf_df.empty:
-            if "代码" in etf_df.columns:
-                matched = etf_df[etf_df["代码"] == code]
-                if not matched.empty and "名称" in matched.columns:
-                    return str(matched.iloc[0]["名称"])
-    except Exception:
-        pass
-    
     return None
 
 
@@ -994,7 +983,7 @@ def update_sheet(ws, name_map=None):
                     logging.warning(f"[{ws.title}] 代码 {code} 净值获取失败，但已获取名称：{e}")
                     ws.cell(row=row_idx, column=2, value=name)
                     for col in range(3, 11):  # C到J列全部清空
-                        ws.cell(row=row_idx, column=col, value=None)
+                        ws.cell(row=row_idx, column=col, value="")
                     success += 1
                 else:
                     logging.warning(f"[{ws.title}] 代码 {code} 数据获取失败：{e}")
