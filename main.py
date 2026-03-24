@@ -54,7 +54,7 @@ ALL_SHEETS = AUTO_SHEETS + [MANUAL_SHEET]  # 所有需要存在的Sheet
 
 # 表头定义（10列，A-J）
 HEADERS = [
-    "产品代码", "产品名称", "最新累计净值",
+    "产品代码", "产品名称", "最新单位净值",
     "当日收益率(%)", "近7天收益率(%)", "近1月收益率(%)", "近1年收益率(%)",
     "近1年波动率(%)", "近1年夏普",
     "成立以来收益率(%)"
@@ -498,13 +498,13 @@ def fetch_fund_name_from_akshare(code: str):
 
 def fetch_fund_data(code: str):
     """
-    获取基金数据（统一使用 AKShare 累计净值走势接口）
-    所有收益率均基于累计净值计算（含分红复利）
+    获取基金数据（使用单位净值走势接口，重构复权净值）
+    所有收益率均基于日增长率的几何累乘计算（反映真实的红利再投资复利曲线）
 
     返回字典：
         {
             "name": 名称或 None,
-            "nav": 最新累计净值(float) 或 None,
+            "nav": 最新单位净值(float) 或 None,
             "today_pct": 当日收益率(float, %) 或 None,
             "week_pct": 近7天收益率(float, %) 或 None,
             "month_pct": 近1月收益率(float, %) 或 None,
@@ -512,20 +512,19 @@ def fetch_fund_data(code: str):
             "since_inception_pct": 成立以来收益率(float, %) 或 None,
             "is_building_period": True/False (是否为建仓期/封闭期基金)
         }
-    如果失败则抛异常；如果是建仓期基金，返回部分数据并标记 is_building_period=True
     """
     if not HAS_AKSHARE:
         raise RuntimeError("akshare 未安装，无法获取基金数据")
 
-    # 使用累计净值走势作为唯一数据源
+    # 使用单位净值走势作为数据源（其日增长率是除权平滑后的真实涨跌）
     try:
-        df = ak.fund_open_fund_info_em(symbol=code, indicator="累计净值走势")
+        df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
     except Exception as e:
         name = fetch_fund_name_from_akshare(code)
         if name:
             raise RuntimeError(f"建仓期/封闭期基金: {e}")
         else:
-            raise RuntimeError(f"AKShare 获取累计净值走势失败：{e}")
+            raise RuntimeError(f"AKShare 获取单位净值走势失败：{e}")
 
     # 检查数据是否为空（建仓期基金）
     if df is None or df.empty:
@@ -544,19 +543,21 @@ def fetch_fund_data(code: str):
         else:
             raise RuntimeError("AKShare 返回空数据且无法获取基金名称")
 
-    # 规范字段名（不同版本列名可能略有差异，做个兼容）
+    # 规范字段名
     col_map = {}
     for col in df.columns:
         c = str(col)
         if "净值日期" in c or "日期" in c or "date" in c.lower():
             col_map["date"] = col
-        elif "累计净值" in c:
-            col_map["acc_nav"] = col
+        elif "单位净值" in c and "累计" not in c:
+            col_map["unit_nav"] = col
+        elif "日增长率" in c or "涨跌幅" in c:
+            col_map["daily_growth"] = col
         elif "基金名称" in c or "名称" in c or "name" in c.lower():
             col_map["name"] = col
 
-    if "date" not in col_map or "acc_nav" not in col_map:
-        raise RuntimeError("AKShare 累计净值数据列结构无法解析")
+    if "date" not in col_map or "unit_nav" not in col_map or "daily_growth" not in col_map:
+        raise RuntimeError("AKShare 单位净值数据列结构无法解析")
 
     df = df.copy()
     df[col_map["date"]] = pd.to_datetime(df[col_map["date"]], errors="coerce")
@@ -579,11 +580,19 @@ def fetch_fund_data(code: str):
         else:
             raise RuntimeError("AKShare 处理后数据为空且无法获取基金名称")
 
+    # 核心复利重构：清洗日增长率并计算虚拟复权净值曲线
+    daily_str = df[col_map["daily_growth"]].astype(str).str.replace("%", "", regex=False)
+    # 将无法转换为数字的置为0（比如上市第一天的空缺或节假日）
+    daily_float = pd.to_numeric(daily_str, errors="coerce").fillna(0.0) / 100.0
+    
+    # 构建从1.0开始的几何累乘真实复权曲线
+    df["adj_nav"] = (1.0 + daily_float).cumprod()
+
     latest = df.iloc[-1]
 
-    # 获取最新累计净值
+    # 获取最新单位净值 (C列)
     try:
-        nav = float(latest[col_map["acc_nav"]])
+        nav = float(latest[col_map["unit_nav"]])
     except Exception:
         nav = None
 
@@ -597,92 +606,88 @@ def fetch_fund_data(code: str):
     if not name:
         name = fetch_fund_name_from_akshare(code)
 
-    # 计算当日收益率：今日累计净值 / 昨日累计净值 - 1
+    # 当日收益率：直接取最新的日增长率乘 100
     today_pct = None
-    if nav is not None and len(df) >= 2:
-        try:
-            prev_acc_nav = float(df.iloc[-2][col_map["acc_nav"]])
-            if prev_acc_nav > 0:
-                today_pct = (nav / prev_acc_nav - 1.0) * 100.0
-        except Exception:
-            today_pct = None
+    if len(daily_float) > 0:
+        today_pct = float(daily_float.iloc[-1]) * 100.0
 
-    # 计算近7天收益率：最近7个交易日的累计净值变化
+    # 计算近7天收益率：基于复权净值
     week_pct = None
-    if nav is not None and len(df) >= 7:
+    if len(df) >= 7:
         try:
-            acc_nav_7_ago = float(df.iloc[-7][col_map["acc_nav"]])
-            if acc_nav_7_ago > 0:
-                week_pct = (nav / acc_nav_7_ago - 1.0) * 100.0
+            adj_now = float(latest["adj_nav"])
+            adj_7_ago = float(df.iloc[-7]["adj_nav"])
+            if adj_7_ago > 0:
+                week_pct = (adj_now / adj_7_ago - 1.0) * 100.0
         except Exception:
             week_pct = None
 
-    # 计算近1月收益率：30天前的累计净值
+    # 计算近1月收益率：30天前的复权净值
     month_pct = None
-    if nav is not None and len(df) > 0:
+    if len(df) > 0:
         try:
-            latest_date = pd.to_datetime(df.iloc[-1][col_map["date"]])
+            latest_date = pd.to_datetime(latest[col_map["date"]])
             target_date = latest_date - pd.Timedelta(days=30)
             mask = df[col_map["date"]] <= target_date
             if mask.any():
                 month_df = df[mask]
                 if len(month_df) > 0:
-                    acc_nav_month_ago = float(month_df.iloc[-1][col_map["acc_nav"]])
-                    if acc_nav_month_ago > 0:
-                        month_pct = (nav / acc_nav_month_ago - 1.0) * 100.0
+                    adj_month_ago = float(month_df.iloc[-1]["adj_nav"])
+                    if adj_month_ago > 0:
+                        adj_now = float(latest["adj_nav"])
+                        month_pct = (adj_now / adj_month_ago - 1.0) * 100.0
         except Exception:
             month_pct = None
 
-    # 计算近1年收益率、波动率、夏普比率（复用同一段数据，无额外请求）
+    # 计算近1年收益率、波动率、夏普比率
     year_pct = None
     volatility_1y_pct = None
     sharpe_1y = None
-    if nav is not None and len(df) > 0:
+    if len(df) > 0:
         try:
-            latest_date = pd.to_datetime(df.iloc[-1][col_map["date"]])
+            latest_date = pd.to_datetime(latest[col_map["date"]])
             target_date = latest_date - pd.Timedelta(days=365)
             mask = df[col_map["date"]] <= target_date
 
-            # 只有基金成立超过1年（即存在365天前的数据点），才计算这组指标
             if mask.any():
                 year_df = df[mask]
                 if len(year_df) > 0:
-                    acc_nav_year_ago = float(year_df.iloc[-1][col_map["acc_nav"]])
-                    if acc_nav_year_ago > 0:
-                        year_pct = (nav / acc_nav_year_ago - 1.0) * 100.0
+                    adj_year_ago = float(year_df.iloc[-1]["adj_nav"])
+                    if adj_year_ago > 0:
+                        adj_now = float(latest["adj_nav"])
+                        year_pct = (adj_now / adj_year_ago - 1.0) * 100.0
 
-                # 近1年数据子集（用于计算波动率）：成立超过1年才执行
+                # 波动率计算：直接利用每日真实的日增长率 (daily_float) 的后一年的部分
                 year_mask = df[col_map["date"]] > target_date
                 year_data = df[year_mask]
-
-                # 计算近1年年化波动率（日收益率标准差 × √252）
-                if len(year_data) >= 5:  # 至少5个交易日
+                
+                if len(year_data) >= 5:
                     try:
-                        daily_returns = year_data[col_map["acc_nav"]].astype(float).pct_change().dropna()
-                        if len(daily_returns) >= 2:
-                            vol_decimal = daily_returns.std() * math.sqrt(252)
+                        # 日收益率序列 (直接基于日增长率，而不是价格相比，这样最真实)
+                        year_daily_returns = daily_float[year_mask]
+                        if len(year_daily_returns) >= 2:
+                            vol_decimal = year_daily_returns.std() * math.sqrt(252)
                             volatility_1y_pct = vol_decimal * 100.0
-                            # 夏普比率：仅在年化收益率为正时有意义
-                            # 负收益率时夏普无意义（结果虽可计算但容易误导），置空
+                            
                             if year_pct is not None and year_pct >= 0 and vol_decimal > 0:
                                 sharpe_1y = (year_pct / 100.0 - RISK_FREE_RATE_ANNUAL) / vol_decimal
                             else:
                                 sharpe_1y = None
-
                     except Exception:
                         volatility_1y_pct = None
                         sharpe_1y = None
         except Exception:
             year_pct = None
 
-    # 计算成立以来收益率：最新累计净值 / 首日累计净值 - 1（直接使用已有数据，无需额外请求）
+    # 成立以来收益率：基于复权净值
     since_inception_pct = None
-    if nav is not None and len(df) > 0:
+    if len(df) > 0:
         try:
-            inception_acc_nav = float(df.iloc[0][col_map["acc_nav"]])
-            if inception_acc_nav > 0:
-                since_inception_pct = (nav / inception_acc_nav - 1.0) * 100.0
-                logging.info(f"代码 {code} 使用累计净值计算全部收益率（含分红）")
+            adj_start = float(df.iloc[0]["adj_nav"])
+            adj_now = float(latest["adj_nav"])
+            if adj_start > 0:
+                since_inception_pct = (adj_now / adj_start - 1.0) * 100.0
+                logging.info(f"代码 {code} 使用日增长率复权净值建模完成")
         except Exception:
             since_inception_pct = None
 
@@ -1078,6 +1083,16 @@ def main():
             if keys_to_delete:
                 logging.info(f"Sheet '{sheet_name}': 清除了 {len(keys_to_delete)} 个空单元格")
     
+    # 为所有有数据的Sheet（包括私募资管）添加自动筛选和冻结窗格
+    for sheet_name in wb.sheetnames:
+        filter_ws = wb[sheet_name]
+        # 只要有一行一列数据就加上筛选器
+        if filter_ws.max_row >= 1 and filter_ws.max_column >= 1:
+            filter_ws.auto_filter.ref = filter_ws.dimensions
+            # 冻结第一行(表头)和第一列(代码)
+            filter_ws.freeze_panes = "B2"
+            logging.info(f"Sheet '{sheet_name}' 已启用表头自动筛选及首行首列冻结")
+
     # 保存文件（覆盖）
     wb.save(file_path)
 
