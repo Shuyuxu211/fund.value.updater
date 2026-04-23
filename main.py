@@ -33,6 +33,20 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
+# ===================== 网络请求补丁 =====================
+# 修复 AKShare 内部 requests.get 在部分网络环境（如存在无响应的 CDN 节点或 IPv6 丢包）下
+# 因默认无 timeout 而导致长时间阻塞（Windows TCP timeout 约 42s）的问题。
+# 强制加入连接超时机制（3秒），使其能极速 Failover（故障转移）到下一个健康的 IP。
+import requests
+_original_get = requests.get
+
+def _patched_get(*args, **kwargs):
+    if 'timeout' not in kwargs:
+        kwargs['timeout'] = (3.0, 10.0)
+    return _original_get(*args, **kwargs)
+
+requests.get = _patched_get
+
 # ===================== 依赖检查 =====================
 
 try:
@@ -473,23 +487,14 @@ def load_fund_name_map():
 def fetch_fund_name_from_akshare(code: str):
     """
     尝试从 AKShare 获取基金名称（用于建仓期基金）
+    优先使用已加载的全量映射，如果不存在则返回None，避免重复请求导致卡顿和封禁
     
     返回:
         基金名称字符串，如果失败则返回 None
     """
-    if not HAS_AKSHARE:
-        return None
-        
-    try:
-        # 尝试从 AKShare 获取基金名称列表并匹配
-        name_df = ak.fund_em_fund_name()
-        if name_df is not None and not name_df.empty:
-            if "基金代码" in name_df.columns:
-                matched = name_df[name_df["基金代码"] == code]
-                if not matched.empty and "基金简称" in matched.columns:
-                    return str(matched.iloc[0]["基金简称"])
-    except Exception:
-        pass
+    global _fund_name_map
+    if _fund_name_map and code in _fund_name_map:
+        return _fund_name_map[code]
         
     return None
 
